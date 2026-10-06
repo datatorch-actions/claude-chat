@@ -1,0 +1,70 @@
+name: Claude Chat
+author: DataTorch
+description: >-
+  One turn of a chat thread with a headless Claude Code agent on the
+  runner. A thread is one Claude Code session: the first turn starts it
+  and returns its session_id, later turns pass that id back to resume
+  it with full memory. Before each turn the project's context/ folder
+  is synced into a per-project working directory with a generated
+  CLAUDE.md, so the agent reads the same standing context as the
+  project's model steps. Tools are limited to the project's DataTorch
+  MCP server (pipelines as tools), Read (working directory only),
+  WebFetch and WebSearch; no shell, no file writes. Every turn's
+  transcript is uploaded to the project under chat/<thread_id>/.
+  Requires the claude CLI on the runner (PATH or ~/.local/bin),
+  authenticated with CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY, and
+  a DataTorch API key (DATATORCH_API_KEY, or the runner machine's
+  stored `datatorch login`).
+inputs:
+  message:
+    type: string
+    description: The user's message for this turn.
+    required: true
+  session_id:
+    type: string
+    description: The session_id output of the thread's previous turn. Empty starts a new thread.
+    default: ""
+  thread_id:
+    type: string
+    description: Identifier for the thread in the record (transcripts land under chat/<thread_id>/). Empty uses the session_id.
+    default: ""
+  project:
+    type: string
+    description: The project the agent works for, as <login>/<slug>. Its context/ folder, MCP server and storage are used.
+    default: datatorch/datatorch
+  system:
+    type: string
+    description: Optional extra instructions appended to the generated CLAUDE.md.
+    default: ""
+  model:
+    type: string
+    description: Optional model override (e.g. claude-sonnet-5-5). Empty uses the CLI default.
+    default: ""
+  max_turns:
+    type: integer
+    description: Maximum agent turns within this message; 0 means no explicit cap.
+    default: 30
+outputs:
+  reply:
+    type: string
+    description: The agent's reply to the message.
+  session_id:
+    type: string
+    description: Pass this back as session_id on the next turn of the thread.
+  transcript_path:
+    type: string
+    description: Project path of this turn's uploaded transcript (empty if the upload failed).
+env:
+  CLAUDE_CODE_OAUTH_TOKEN:
+    description: Claude subscription token from `claude setup-token`. One of this or ANTHROPIC_API_KEY.
+  ANTHROPIC_API_KEY:
+    description: Alternative to CLAUDE_CODE_OAUTH_TOKEN for API-billed operators.
+  DATATORCH_API_KEY:
+    description: User API key for syncing context/, uploading transcripts and the MCP server. Falls back to the runner machine's stored `datatorch login`.
+  DATATORCH_AGENT_KEY:
+    description: Optional project agent key. When set, the MCP server is called as that agent (its role's permissions) instead of as the API key's user.
+  DATATORCH_API_URL:
+    description: Optional instance URL; defaults to the stored login's URL, then https://datatorch.io.
+runs:
+  using: python
+  main: main.py

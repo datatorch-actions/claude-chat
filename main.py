@@ -41,6 +41,8 @@ CONTEXT_FILES_MAX = 100
 MCP_SERVER = "datatorch"
 DEFAULT_STORAGE_LINK_NAME = "DataTorch Storage"
 BUILTIN_TOOLS = "Read,WebFetch,WebSearch"
+# Pinned rather than the CLI default, which differs per runner machine.
+DEFAULT_MODEL = "claude-opus-5-5"
 
 
 def log(message: str):
@@ -416,7 +418,7 @@ def main():
         fail("Input 'project' must be <login>/<slug>.")
     login, slug = ref.split("/")
     system = inputs.get("system") or ""
-    model = (inputs.get("model") or "").strip()
+    model = (inputs.get("model") or "").strip() or DEFAULT_MODEL
     max_turns = int(inputs.get("max_turns") or 0)
 
     session_id = resume_id or str(uuid.uuid4())
@@ -484,8 +486,7 @@ def main():
     cmd += ["--resume", resume_id] if resume_id else ["--session-id", session_id]
     if max_turns > 0:
         cmd += ["--max-turns", str(max_turns)]
-    if model:
-        cmd += ["--model", model]
+    cmd += ["--model", model]
 
     before_path = find_transcript(session_id) if resume_id else None
     before_lines = count_lines(before_path)

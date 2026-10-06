@@ -38,8 +38,8 @@ inputs:
     default: ""
   model:
     type: string
-    description: Optional model override (e.g. claude-sonnet-5-5). Empty uses the CLI default.
-    default: ""
+    description: Claude model for the session (e.g. claude-sonnet-5-5). Empty also means claude-opus-5-5.
+    default: claude-opus-5-5
   max_turns:
     type: integer
     description: Maximum agent turns within this message; 0 means no explicit cap.

@@ -22,6 +22,7 @@ stdout lines.
 
 import glob
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -356,6 +357,29 @@ def describe_tool(block: dict) -> str:
     return f"[tool] {name} {str(detail)[:160]}".rstrip()
 
 
+# What the Claude process may inherit. It needs its own login and nothing
+# else: the DataTorch credentials belong to this script (context sync,
+# transcript upload) and to the MCP config file, never to the model's
+# environment, where a future tool could expose them.
+CHILD_ENV_KEEP = {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+CHILD_ENV_DROP_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASS")
+
+
+def child_environment(parent: dict) -> dict:
+    """The parent's environment minus every secret Claude does not need."""
+    env = {}
+    for name, value in parent.items():
+        if name in CHILD_ENV_KEEP:
+            env[name] = value
+            continue
+        if name.startswith("DATATORCH_") and name != "DATATORCH_API_URL":
+            continue
+        if name.upper().endswith(CHILD_ENV_DROP_SUFFIXES):
+            continue
+        env[name] = value
+    return env
+
+
 def run_claude(cmd: list, message: str, workdir: str, env: dict):
     """Run one turn, streaming events to the log. Returns (result, stderr)."""
     result_event = None
@@ -424,9 +448,13 @@ def main():
     session_id = resume_id or str(uuid.uuid4())
     thread_id = safe_segment((inputs.get("thread_id") or "").strip() or session_id)
 
-    # One working directory per project: Claude Code keys its session
-    # store on the cwd, so every thread of the project resumes from here.
-    workdir = os.path.join(app_dir(), "chat", safe_segment(f"{login}-{slug}"))
+    # One working directory per project and agent: Claude Code keys its
+    # session store and auto-memory on the cwd, so every thread of the
+    # agent resumes from here, and two agents of one project never share
+    # (or overwrite) each other's CLAUDE.md.
+    agent = (inputs.get("agent") or "").strip()
+    folder = f"{login}-{slug}" + (f"-{agent}" if agent else "")
+    workdir = os.path.join(app_dir(), "chat", safe_segment(folder))
     os.makedirs(workdir, exist_ok=True)
     log(f"[chat] {ref} thread {thread_id} ({'resume ' + resume_id if resume_id else 'new session ' + session_id})")
 
@@ -439,7 +467,16 @@ def main():
         synced = local_context(workdir)
         log(f"[context] sync failed ({ex}); using the {len(synced)} file(s) from the last sync")
 
-    agent_key = os.getenv("DATATORCH_AGENT_KEY")
+    # Which agent this turn speaks as: the runner can hold one key per
+    # agent, each in its own variable (secrets never reach runner steps).
+    # A named variable that is missing fails the turn rather than quietly
+    # acting as the user.
+    key_env = (inputs.get("agent_key_env") or "").strip() or "DATATORCH_AGENT_KEY"
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*_KEY", key_env):
+        fail("Input 'agent_key_env' must be an environment variable name ending in _KEY.")
+    agent_key = os.getenv(key_env)
+    if not agent_key and key_env != "DATATORCH_AGENT_KEY":
+        fail(f"{key_env} is not set in the runner's environment, so this agent has no key to act with.")
     mcp_key = agent_key or dt.key
     mcp_as = "the project agent whose key this runner holds" if agent_key else f"the user {project['viewer']}"
     imported, listed = write_claude_md(workdir, ref, project, synced, mcp_as, system)
@@ -497,7 +534,7 @@ def main():
             "a new thread (empty session_id)."
         )
 
-    env = {k: v for k, v in os.environ.items() if k not in ("DATATORCH_AGENT_KEY",)}
+    env = child_environment(os.environ)
     started = time.time()
     try:
         result_event, stderr_tail = run_claude(cmd, message, workdir, env)

@@ -36,6 +36,14 @@ inputs:
     type: string
     description: Optional extra instructions appended to the generated CLAUDE.md.
     default: ""
+  agent:
+    type: string
+    description: The agent this turn speaks as (its name). Gives the agent its own working directory, so its sessions, memory and CLAUDE.md are never shared with another agent of the project. Empty keeps the project's shared directory.
+    default: ""
+  agent_key_env:
+    type: string
+    description: Name of the runner environment variable holding this agent's key (e.g. DATATORCH_MARKETING_AGENT_KEY). Default DATATORCH_AGENT_KEY, which falls back to the user's key when unset; any other name must be set or the turn fails.
+    default: DATATORCH_AGENT_KEY
   model:
     type: string
     description: Claude model for the session (e.g. claude-sonnet-5-5). Empty also means claude-opus-5-5.
@@ -60,9 +68,9 @@ env:
   ANTHROPIC_API_KEY:
     description: Alternative to CLAUDE_CODE_OAUTH_TOKEN for API-billed operators.
   DATATORCH_API_KEY:
-    description: User API key for syncing context/, uploading transcripts and the MCP server. Falls back to the runner machine's stored `datatorch login`.
+    description: User API key for syncing context/, uploading transcripts and (when no agent key is set) the MCP server. Falls back to the runner machine's stored `datatorch login`. Never passed to the Claude process, which sees only its own login.
   DATATORCH_AGENT_KEY:
-    description: Optional project agent key. When set, the MCP server is called as that agent (its role's permissions) instead of as the API key's user.
+    description: Optional project agent key. When set, the MCP server is called as that agent (its role's permissions) instead of as the API key's user. A runner serving several agents holds one variable per agent and each pipeline names its own with agent_key_env.
   DATATORCH_API_URL:
     description: Optional instance URL; defaults to the stored login's URL, then https://datatorch.io.
 runs:

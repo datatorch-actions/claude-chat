@@ -30,8 +30,13 @@ inputs:
     default: ""
   project:
     type: string
-    description: The project the agent works for, as <login>/<slug>. Its context/ folder, MCP server and storage are used.
-    default: datatorch/datatorch
+    description: >-
+      The project the agent works for, as <login>/<slug>. Its context/
+      folder, MCP server and storage are used. Empty (the default) means
+      the project this run belongs to, which the runner names in
+      DATATORCH_PROJECT_ID (datatorch 0.8.1 or newer), so a pipeline
+      forked into another project works there without editing.
+    default: ""
   system:
     type: string
     description: Optional extra instructions appended to the generated CLAUDE.md.

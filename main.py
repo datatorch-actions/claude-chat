@@ -162,6 +162,26 @@ class DataTorch:
         )
 
 
+def own_project_ref(dt: DataTorch) -> str:
+    """<login>/<slug> of the project the current run belongs to, from the
+    DATATORCH_PROJECT_ID the runner sets (datatorch 0.8.1+)."""
+    project_id = (os.getenv("DATATORCH_PROJECT_ID") or "").strip()
+    if not project_id:
+        fail(
+            "Input 'project' is empty and the runner did not name the run's "
+            "project (DATATORCH_PROJECT_ID). Upgrade the runner to datatorch "
+            "0.8.1 or newer, or pass project as <login>/<slug>."
+        )
+    data = dt.gql(
+        "query ($id: ID!) { projectById(id: $id) { slug owner { login } } }",
+        {"id": project_id},
+    )
+    project = data.get("projectById")
+    if not project:
+        fail(f"Project {project_id} not found, or the API key cannot read it.")
+    return f"{project['owner']['login']}/{project['slug']}"
+
+
 def load_project(dt: DataTorch, login: str, slug: str) -> dict:
     data = dt.gql(
         """
@@ -437,7 +457,12 @@ def main():
     if not message.strip():
         fail("Input 'message' is required.")
     resume_id = (inputs.get("session_id") or "").strip()
-    ref = (inputs.get("project") or "datatorch/datatorch").strip()
+    ref = (inputs.get("project") or "").strip()
+    dt = DataTorch()
+    if not ref:
+        # The project this run belongs to, as the runner names it (datatorch
+        # 0.8.1+). Resolved here so the rest of the turn is one code path.
+        ref = own_project_ref(dt)
     if ref.count("/") != 1:
         fail("Input 'project' must be <login>/<slug>.")
     login, slug = ref.split("/")
@@ -458,7 +483,6 @@ def main():
     os.makedirs(workdir, exist_ok=True)
     log(f"[chat] {ref} thread {thread_id} ({'resume ' + resume_id if resume_id else 'new session ' + session_id})")
 
-    dt = DataTorch()
     project = load_project(dt, login, slug)
     try:
         synced = sync_context(dt, project, workdir)

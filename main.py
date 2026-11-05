@@ -8,11 +8,16 @@ whole conversation. Every turn:
 1. syncs the project's context/ folder (default storage) into a
    per-project working directory and regenerates its CLAUDE.md, which
    imports the context files the way model steps prepend them;
-2. runs claude with only Read (working directory), WebFetch, WebSearch
-   and the project's DataTorch MCP server; no shell, no file writes;
-3. streams the agent's text and tool calls into the step log;
-4. uploads this turn's slice of the session transcript to the project
-   under chat/<thread_id>/ so the record lives in DataTorch.
+2. mirrors the agent's memory notebook (a folder of the project, index
+   plus one file per fact) next to context/ and imports its index;
+3. runs claude with Read (working directory), Write and Edit (the memory
+   folder only), WebFetch, WebSearch and the project's DataTorch MCP
+   server; no shell, no other file writes;
+4. streams the agent's text and tool calls into the step log;
+5. uploads this turn's slice of the session transcript to the project
+   under chat/<thread_id>/ so the record lives in DataTorch, and writes
+   the notebook's changes back to the project as the agent (MCP
+   write_file, so every memory is a file version with the agent's name).
 
 Uses only the Python standard library (plus the runner's own `datatorch`
 package, when present, for the stored login). Inputs arrive as a single
@@ -21,6 +26,7 @@ stdout lines.
 """
 
 import glob
+import hashlib
 import json
 import re
 import os
@@ -42,6 +48,14 @@ CONTEXT_FILES_MAX = 100
 MCP_SERVER = "datatorch"
 DEFAULT_STORAGE_LINK_NAME = "DataTorch Storage"
 BUILTIN_TOOLS = "Read,WebFetch,WebSearch"
+# The memory notebook: a folder of the project mirrored to <workdir>/memory,
+# the only place the agent may write. Its index is imported like context/.
+MEMORY_LOCAL_DIR = "memory"
+MEMORY_INDEX = "MEMORY.md"
+MEMORY_FILES_MAX = 300
+MEMORY_INDEX_IMPORT_MAX_KB = 24
+MEMORY_FILE_MAX_BYTES = 128 * 1024
+MEMORY_TOOLS = "Read,Write,Edit,WebFetch,WebSearch"
 # Pinned rather than the CLI default, which differs per runner machine.
 DEFAULT_MODEL = "claude-opus-5-5"
 
@@ -182,6 +196,51 @@ def own_project_ref(dt: DataTorch) -> str:
     return f"{project['owner']['login']}/{project['slug']}"
 
 
+def mcp_call(dt: DataTorch, login: str, slug: str, key: str, name: str, args: dict) -> dict:
+    """One tools/call on the project's MCP server as `key` (the agent's
+    key when the runner holds one, so a write is attributed to the
+    agent). Returns {text, is_error}."""
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args},
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{dt.url}/api/mcp/{login}/{slug}",
+        data=body,
+        headers={
+            "datatorch-api-key": key,
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+            "user-agent": "claude-chat-action",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as ex:
+        detail = ex.read().decode("utf-8", "replace")[:300]
+        try:
+            detail = json.loads(detail).get("error") or detail
+        except Exception:
+            pass
+        raise RuntimeError(f"MCP {ex.code}: {detail}") from None
+    text = raw.strip()
+    if text.startswith(("event:", "data:")):
+        # Server-sent framing: the JSON-RPC answer is the data line.
+        text = "\n".join(l[5:].strip() for l in text.splitlines() if l.startswith("data:"))
+    reply = json.loads(text)
+    if reply.get("error"):
+        raise RuntimeError(reply["error"].get("message") or json.dumps(reply["error"]))
+    result = reply.get("result") or {}
+    content = result.get("content") or []
+    joined = "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return {"text": joined, "is_error": bool(result.get("isError"))}
+
+
 def load_project(dt: DataTorch, login: str, slug: str) -> dict:
     data = dt.gql(
         """
@@ -224,13 +283,29 @@ def resolve_link(project: dict):
     return chosen["id"] if chosen else None
 
 
-def context_rows(project: dict) -> list:
-    """The context/ text files in default storage, in the order model
-    steps read them: README.md, then index.md, then by path."""
-    link = project["link"]
+def list_files(dt: DataTorch, login: str, slug: str, prefix: str) -> list:
+    """The project's file rows under a folder prefix."""
+    data = dt.gql(
+        """
+        query ($login: String!, $slug: String!, $where: DatasetFileWhereInput) {
+          project(login: $login, slug: $slug) {
+            files(input: { where: $where, perPage: 500 }) { nodes { id path kilobytes linkId } }
+          }
+        }
+        """,
+        {"login": login, "slug": slug, "where": {"path": {"like": f"{prefix}%"}}},
+    )
+    return ((data.get("project") or {}).get("files") or {}).get("nodes") or []
+
+
+def folder_rows(nodes: list, link: str, prefix: str, first: tuple, limit: int) -> list:
+    """The text files of one folder in default storage, `first` names
+    leading, then by path."""
     seen, rows = set(), []
-    for row in project["files"]["nodes"]:
-        rel = row["path"][len(CONTEXT_FOLDER) :]
+    for row in nodes:
+        if not row["path"].startswith(prefix):
+            continue
+        rel = row["path"][len(prefix) :]
         ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
         safe = rel and ".." not in rel.split("/") and not rel.startswith("/")
         if row["linkId"] != link or not safe or ext not in CONTEXT_TEXT_EXTENSIONS:
@@ -239,25 +314,39 @@ def context_rows(project: dict) -> list:
             continue
         seen.add(rel)
         rows.append({**row, "rel": rel})
-    rank = {"README.md": 0, "index.md": 1}
-    rows.sort(key=lambda r: (rank.get(r["rel"], 2), r["rel"]))
-    return rows[:CONTEXT_FILES_MAX]
+    rank = {name: i for i, name in enumerate(first)}
+    rows.sort(key=lambda r: (rank.get(r["rel"], len(first)), r["rel"]))
+    return rows[:limit]
 
 
-def sync_context(dt: DataTorch, project: dict, workdir: str) -> list:
-    """Mirror context/ into the working directory; returns the synced
-    relative paths with their sizes."""
-    target = os.path.join(workdir, "context")
+def context_rows(project: dict) -> list:
+    """The context/ text files in default storage, in the order model
+    steps read them: README.md, then index.md, then by path."""
+    return folder_rows(
+        project["files"]["nodes"], project["link"], CONTEXT_FOLDER, ("README.md", "index.md"), CONTEXT_FILES_MAX
+    )
+
+
+def sync_folder(dt: DataTorch, rows: list, target: str) -> list:
+    """Mirror the rows into `target`; returns the synced files with their
+    sizes, ids and digests. Files gone from the server leave the mirror."""
     os.makedirs(target, exist_ok=True)
     synced = []
-    for row in context_rows(project):
+    for row in rows:
         content = dt.download(row["id"])
         path = os.path.join(target, *row["rel"].split("/"))
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(content)
-        synced.append({"rel": row["rel"], "bytes": len(content)})
-    # Files deleted on the server leave the mirror too.
+        synced.append(
+            {
+                "rel": row["rel"],
+                "bytes": len(content),
+                "id": row["id"],
+                "sha": hashlib.sha256(content).hexdigest(),
+                "md5": hashlib.md5(content).hexdigest(),
+            }
+        )
     keep = {os.path.join(target, *s["rel"].split("/")) for s in synced}
     for root, _, files in os.walk(target):
         for name in files:
@@ -265,6 +354,97 @@ def sync_context(dt: DataTorch, project: dict, workdir: str) -> list:
             if path not in keep:
                 os.remove(path)
     return synced
+
+
+def sync_context(dt: DataTorch, project: dict, workdir: str) -> list:
+    """Mirror context/ into the working directory."""
+    return sync_folder(dt, context_rows(project), os.path.join(workdir, "context"))
+
+
+def memory_prefix(value: str, agent: str):
+    """The project folder of the notebook: the `memory` input, else
+    memory/<agent>/ for a named agent, else memory/. `off` = no notebook."""
+    value = (value or "").strip().strip("/")
+    if value.lower() == "off":
+        return None
+    if not value:
+        value = f"memory/{safe_segment(agent)}" if agent else "memory"
+    if ".." in value.split("/") or value.startswith("."):
+        fail("Input 'memory' must be a plain project folder such as memory/chief-of-staff.")
+    return value + "/"
+
+
+def sync_memory(dt: DataTorch, login: str, slug: str, link: str, prefix: str, workdir: str) -> list:
+    """Mirror the notebook into <workdir>/memory before the turn."""
+    nodes = list_files(dt, login, slug, prefix)
+    rows = folder_rows(nodes, link, prefix, (MEMORY_INDEX,), MEMORY_FILES_MAX)
+    return sync_folder(dt, rows, os.path.join(workdir, MEMORY_LOCAL_DIR))
+
+
+def local_memory(workdir: str) -> dict:
+    """The notebook as it is on disk after the turn: rel -> (bytes, sha)."""
+    target = os.path.join(workdir, MEMORY_LOCAL_DIR)
+    found = {}
+    for root, dirs, files in os.walk(target):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.startswith("."):
+                continue
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if ext not in CONTEXT_TEXT_EXTENSIONS:
+                continue
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, target).replace(os.sep, "/")
+            with open(path, "rb") as f:
+                content = f.read()
+            found[rel] = {"bytes": len(content), "sha": hashlib.sha256(content).hexdigest(), "content": content}
+    return found
+
+
+def push_memory(dt: DataTorch, login: str, slug: str, key: str, prefix: str, before: list, workdir: str) -> dict:
+    """Write the notebook's changes back to the project: new and changed
+    files through MCP write_file as `key` (the agent, when the runner
+    holds its key, so the file version carries its name); files the
+    agent removed are deleted with this script's own key, since only the
+    MCP door honours an agent key and it has no delete. Only paths under
+    the notebook prefix are ever touched. Returns counts and the lines
+    logged."""
+    was = {s["rel"]: s for s in before}
+    now = local_memory(workdir)
+    written, deleted, refused = [], [], []
+    for rel, state in sorted(now.items()):
+        earlier = was.get(rel)
+        if earlier and earlier["sha"] == state["sha"]:
+            continue
+        path = prefix + rel
+        if state["bytes"] > MEMORY_FILE_MAX_BYTES:
+            refused.append(f"{path} ({state['bytes'] // 1024} KB is over the {MEMORY_FILE_MAX_BYTES // 1024} KB memory file limit)")
+            continue
+        content = state["content"].decode("utf-8", "replace")
+        args = (
+            {"file_id": earlier["id"], "content": content, "mode": "overwrite", "expected_md5": earlier["md5"]}
+            if earlier
+            else {"path": path, "content": content, "mode": "create"}
+        )
+        try:
+            result = mcp_call(dt, login, slug, key, "write_file", args)
+            if result["is_error"]:
+                refused.append(f"{path}: {result['text'][:300]}")
+            else:
+                written.append(path)
+        except Exception as ex:
+            refused.append(f"{path}: {ex}")
+    gone = [was[rel] for rel in sorted(was) if rel not in now]
+    if gone:
+        try:
+            dt.gql(
+                "mutation ($ids: [ID!]!) { deleteDatasetFiles(ids: $ids) }",
+                {"ids": [row["id"] for row in gone]},
+            )
+            deleted += [prefix + row["rel"] for row in gone]
+        except Exception as ex:
+            refused.append(f"delete {', '.join(prefix + row['rel'] for row in gone)}: {ex}")
+    return {"written": written, "deleted": deleted, "refused": refused}
 
 
 def local_context(workdir: str) -> list:
@@ -281,7 +461,88 @@ def local_context(workdir: str) -> list:
     return found
 
 
-def write_claude_md(workdir: str, ref: str, project: dict, synced: list, mcp_as: str, system: str):
+def memory_bullet(prefix) -> str:
+    """The write rule in the 'How you work here' list."""
+    if prefix is None:
+        return (
+            "- You cannot run shell commands or write files. If something in context/ "
+            "is wrong or stale, say exactly what should change and why."
+        )
+    return (
+        f"- You cannot run shell commands. The only place you may write is `{MEMORY_LOCAL_DIR}/`, "
+        "your memory notebook (see Memory below). If something in context/ is wrong or stale, say "
+        "exactly what should change and why; a decision on it goes through the project's "
+        "context-edit door, never into memory."
+    )
+
+
+def memory_lines(prefix, memory: list) -> list:
+    """The CLAUDE.md section that gives the agent its notebook."""
+    index = next((m for m in memory if m["rel"] == MEMORY_INDEX), None)
+    others = [m["rel"] for m in memory if m["rel"] != MEMORY_INDEX]
+    lines = [
+        "## Memory",
+        "",
+        f"You have a persistent memory at `{MEMORY_LOCAL_DIR}/` (project folder `{prefix}`). "
+        "It is yours alone, shared by every thread you hold in this project, and readable "
+        "by every member of the project. It is mirrored from the project before each "
+        "message, and after each message the files you changed are written back to the "
+        "project under your name, where people can read, edit or delete them.",
+        "",
+        f"`{MEMORY_LOCAL_DIR}/{MEMORY_INDEX}` is the index: one line per memory, "
+        "`- [Title](file.md): hook`, nothing else. It is imported below. Each memory "
+        "is one small file next to it holding one fact, with frontmatter:",
+        "",
+        "```markdown",
+        "---",
+        "name: <short-kebab-case-slug>",
+        "description: <one line, used to decide whether to read the file>",
+        "type: user | feedback | project | reference",
+        "---",
+        "",
+        "<the fact; for feedback and project, follow with **Why:** and **How to apply:** lines>",
+        "```",
+        "",
+        "`user`: who the person is and how they like to work. `feedback`: guidance "
+        "you were given, corrections and confirmed approaches, with the why. "
+        "`project`: where work stands that the record does not hold, with absolute "
+        "dates. `reference`: pointers to things outside the project.",
+        "",
+        "Save as you go, without asking: when the person corrects you, tells you how "
+        "they want something done, or when the state of a piece of work changes and "
+        "the next thread would need it. Write the file with Write, then add its line "
+        "to the index. Before saving, Read the index for a file that already covers "
+        "it and update that one instead; delete a memory that turns out wrong (the "
+        "file and its line). Read a memory file when its index line says it is "
+        "relevant to what is being asked. A memory says what was true when it was "
+        "written. Never save what only matters to this conversation.",
+        "",
+        "Three rules that keep memory honest:",
+        "",
+        "1. Memory never restates what `context/` or the project's record already "
+        "holds: no numbers, no customer facts, no rules. Point at the file instead; "
+        "a copied fact drifts from its source.",
+        "2. A rule never lives in memory. When the person decides a rule, it goes "
+        "through the context-edit door; memory may only note that it did.",
+        "3. Where `context/` and a memory disagree, `context/` wins and the memory "
+        "is deleted.",
+        "",
+    ]
+    if index:
+        lines += [f"@{MEMORY_LOCAL_DIR}/{MEMORY_INDEX}"]
+        if others:
+            lines += ["", f"Memory files on disk: {', '.join(sorted(others))}."]
+    else:
+        lines += [
+            f"The notebook is empty: no `{MEMORY_LOCAL_DIR}/{MEMORY_INDEX}` yet. Create it "
+            "with the first memory you save."
+        ]
+    return lines
+
+
+def write_claude_md(
+    workdir: str, ref: str, project: dict, synced: list, mcp_as: str, system: str, memory_prefix_value=None, memory=None
+):
     imported, listed, budget = [], [], CONTEXT_IMPORT_MAX_KB * 1024
     for s in synced:
         if s["bytes"] <= budget:
@@ -310,8 +571,7 @@ def write_claude_md(workdir: str, ref: str, project: dict, synced: list, mcp_as:
         f"principal you are ({mcp_as}). Runs can take minutes; report the run id "
         "and its status rather than waiting indefinitely.",
         "- Read works inside this directory only. WebFetch and WebSearch reach the web.",
-        "- You cannot run shell commands or write files. If something in context/ "
-        "is wrong or stale, say exactly what should change and why.",
+        memory_bullet(memory_prefix_value),
         "- Sending a message to a person, publishing anything, and spending money "
         "need the person's explicit yes in this thread first. Running a pipeline "
         "that does one of those counts: name the pipeline and what it will do, "
@@ -322,6 +582,8 @@ def write_claude_md(workdir: str, ref: str, project: dict, synced: list, mcp_as:
         "to the project under `chat/` as the record.",
         "- Reply plainly and briefly. Lead with the answer.",
     ]
+    if memory_prefix_value is not None:
+        lines += ["", *memory_lines(memory_prefix_value, memory or [])]
     if system.strip():
         lines += ["", "## Additional instructions", "", system.strip()]
     if imported or listed:
@@ -491,6 +753,26 @@ def main():
         synced = local_context(workdir)
         log(f"[context] sync failed ({ex}); using the {len(synced)} file(s) from the last sync")
 
+    # The notebook: mirrored before the turn, pushed back after it. A
+    # failed mirror means no notebook this turn (and no push, so a stale
+    # mirror can never overwrite the project's copy).
+    mem_prefix = memory_prefix(inputs.get("memory"), agent)
+    memory, memory_ok = [], False
+    if mem_prefix and project["link"]:
+        try:
+            memory = sync_memory(dt, login, slug, project["link"], mem_prefix, workdir)
+            memory_ok = True
+            index_kb = next((m["bytes"] for m in memory if m["rel"] == MEMORY_INDEX), 0) / 1024
+            log(f"[memory] {mem_prefix}: {len(memory)} file(s) mirrored" + (f", index {index_kb:.1f} KB" if index_kb else ", no index yet"))
+            if index_kb > MEMORY_INDEX_IMPORT_MAX_KB:
+                log(f"[memory] the index is over {MEMORY_INDEX_IMPORT_MAX_KB} KB; it should stay one line per memory")
+        except Exception as ex:
+            log(f"[memory] mirror failed ({ex}); no notebook this turn")
+            mem_prefix = None
+    elif mem_prefix:
+        log("[memory] the project has no storage; no notebook this turn")
+        mem_prefix = None
+
     # Which agent this turn speaks as: the runner can hold one key per
     # agent, each in its own variable (secrets never reach runner steps).
     # A named variable that is missing fails the turn rather than quietly
@@ -503,7 +785,7 @@ def main():
         fail(f"{key_env} is not set in the runner's environment, so this agent has no key to act with.")
     mcp_key = agent_key or dt.key
     mcp_as = "the project agent whose key this runner holds" if agent_key else f"the user {project['viewer']}"
-    imported, listed = write_claude_md(workdir, ref, project, synced, mcp_as, system)
+    imported, listed = write_claude_md(workdir, ref, project, synced, mcp_as, system, mem_prefix, memory)
     log(f"[context] CLAUDE.md imports {len(imported)} file(s)" + (f", lists {len(listed)} over budget" if listed else ""))
 
     # The MCP config carries the key, so it lives outside the working
@@ -532,18 +814,23 @@ def main():
         "stream-json",
         "--verbose",
         # The governance: only these built-ins exist in the session at
-        # all (no Bash, Write, Edit), only this MCP server is loaded, and
-        # the runner user's own settings (allow rules, hooks) are ignored.
+        # all (no Bash; Write and Edit only with a notebook, and then
+        # only inside memory/, since in -p mode a tool call no rule allows
+        # is refused), only this MCP server is loaded, and the runner
+        # user's own settings (allow rules, hooks) are ignored.
         "--tools",
-        BUILTIN_TOOLS,
+        MEMORY_TOOLS if mem_prefix else BUILTIN_TOOLS,
         "--allowedTools",
-        f"WebFetch,WebSearch,mcp__{MCP_SERVER}",
+        f"WebFetch,WebSearch,mcp__{MCP_SERVER}"
+        + (f",Write({MEMORY_LOCAL_DIR}/**),Edit({MEMORY_LOCAL_DIR}/**)" if mem_prefix else ""),
         "--strict-mcp-config",
         "--mcp-config",
         mcp_path,
         "--setting-sources",
         "project",
     ]
+    if mem_prefix:
+        cmd += ["--disallowedTools", "Write(context/**),Edit(context/**),Write(CLAUDE.md),Edit(CLAUDE.md)"]
     cmd += ["--resume", resume_id] if resume_id else ["--session-id", session_id]
     if max_turns > 0:
         cmd += ["--max-turns", str(max_turns)]
@@ -604,9 +891,29 @@ def main():
     else:
         log(f"[record] transcript for session {session_id} not found under {claude_config_dir()}")
 
+    # The notebook: what the agent wrote goes back to the project.
+    memory_changes = ""
+    if mem_prefix and memory_ok:
+        pushed = push_memory(dt, login, slug, mcp_key, mem_prefix, memory, workdir)
+        for path in pushed["written"]:
+            log(f"[memory] wrote {path}")
+        for path in pushed["deleted"]:
+            log(f"[memory] deleted {path}")
+        for line in pushed["refused"]:
+            log(f"[memory] refused {line}")
+        parts = []
+        if pushed["written"]:
+            parts.append(f"{len(pushed['written'])} written")
+        if pushed["deleted"]:
+            parts.append(f"{len(pushed['deleted'])} deleted")
+        if pushed["refused"]:
+            parts.append(f"{len(pushed['refused'])} refused")
+        memory_changes = ", ".join(parts)
+
     output("reply", reply)
     output("session_id", session_id)
     output("transcript_path", transcript_path)
+    output("memory_changes", memory_changes)
 
     if is_error:
         # Downstream steps skip and the run shows FAILED, but session_id is

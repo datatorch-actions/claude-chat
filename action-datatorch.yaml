@@ -7,10 +7,15 @@ description: >-
   it with full memory. Before each turn the project's context/ folder
   is synced into a per-project working directory with a generated
   CLAUDE.md, so the agent reads the same standing context as the
-  project's model steps. Tools are limited to the project's DataTorch
-  MCP server (pipelines as tools), Read (working directory only),
-  WebFetch and WebSearch; no shell, no file writes. Every turn's
-  transcript is uploaded to the project under chat/<thread_id>/.
+  project's model steps. The agent's memory notebook (a folder of the
+  project: MEMORY.md index plus one file per fact, see the memory
+  input) is mirrored next to it and its index imported; after the turn
+  the files the agent changed are written back to the project as the
+  agent (MCP write_file), so every memory is a file version with its
+  name. Tools are limited to the project's DataTorch MCP server
+  (pipelines as tools), Read (working directory only), Write and Edit
+  (the memory folder only), WebFetch and WebSearch; no shell. Every
+  turn's transcript is uploaded to the project under chat/<thread_id>/.
   Requires the claude CLI on the runner (PATH or ~/.local/bin),
   authenticated with CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY, and
   a DataTorch API key (DATATORCH_API_KEY, or the runner machine's
@@ -45,6 +50,10 @@ inputs:
     type: string
     description: The agent this turn speaks as (its name). Gives the agent its own working directory, so its sessions, memory and CLAUDE.md are never shared with another agent of the project. Empty keeps the project's shared directory.
     default: ""
+  memory:
+    type: string
+    description: Project folder of the agent's memory notebook (MEMORY.md index + one file per fact, written by the agent itself, readable by every member). Empty means memory/<agent>/ when agent is set, else memory/. "off" gives the agent no notebook and no Write tool.
+    default: ""
   agent_key_env:
     type: string
     description: Name of the runner environment variable holding this agent's key (e.g. DATATORCH_MARKETING_AGENT_KEY). Default DATATORCH_AGENT_KEY, which falls back to the user's key when unset; any other name must be set or the turn fails.
@@ -67,6 +76,9 @@ outputs:
   transcript_path:
     type: string
     description: Project path of this turn's uploaded transcript (empty if the upload failed).
+  memory_changes:
+    type: string
+    description: What the turn changed in the memory notebook, e.g. "2 written, 1 deleted" (empty when nothing changed or the agent has no notebook).
 env:
   CLAUDE_CODE_OAUTH_TOKEN:
     description: Claude subscription token from `claude setup-token`. One of this or ANTHROPIC_API_KEY.
@@ -75,7 +87,7 @@ env:
   DATATORCH_API_KEY:
     description: User API key for syncing context/, uploading transcripts and (when no agent key is set) the MCP server. Falls back to the runner machine's stored `datatorch login`. Never passed to the Claude process, which sees only its own login.
   DATATORCH_AGENT_KEY:
-    description: Optional project agent key. When set, the MCP server is called as that agent (its role's permissions) instead of as the API key's user. A runner serving several agents holds one variable per agent and each pipeline names its own with agent_key_env.
+    description: Optional project agent key. When set, the MCP server is called as that agent (its role's permissions) instead of as the API key's user, and memory writes carry the agent's name (its role needs FILE_CREATE and FILE_UPDATE; deletions of its own memory files use the user key). A runner serving several agents holds one variable per agent and each pipeline names its own with agent_key_env.
   DATATORCH_API_URL:
     description: Optional instance URL; defaults to the stored login's URL, then https://datatorch.io.
 runs:

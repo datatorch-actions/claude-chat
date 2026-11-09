@@ -607,6 +607,26 @@ def claude_config_dir() -> str:
     return os.getenv("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 
 
+def read_result(result_event, stderr_tail):
+    """The reply text and whether the agent ended in error; fails the step
+    when claude produced no result event at all."""
+    if result_event is None:
+        log("No result event from claude CLI.")
+        fail(stderr_tail or "claude exited without output.")
+    reply = result_event.get("result") or ""
+    is_error = bool(result_event.get("is_error")) or (
+        result_event.get("subtype") not in (None, "success")
+    )
+    return reply, is_error
+
+
+def context_overflow(reply: str, stderr_tail: str) -> bool:
+    """True when the model refused because the resumed session no longer
+    fits its context window (Claude Code reports it as the result text)."""
+    text = f"{reply}\n{stderr_tail or ''}".lower()
+    return "prompt is too long" in text or ("context window" in text and "exceed" in text)
+
+
 def find_transcript(session_id: str):
     matches = glob.glob(
         os.path.join(claude_config_dir(), "projects", "*", f"{session_id}.jsonl")
@@ -831,6 +851,7 @@ def main():
     ]
     if mem_prefix:
         cmd += ["--disallowedTools", "Write(context/**),Edit(context/**),Write(CLAUDE.md),Edit(CLAUDE.md)"]
+    base_cmd = list(cmd)
     cmd += ["--resume", resume_id] if resume_id else ["--session-id", session_id]
     if max_turns > 0:
         cmd += ["--max-turns", str(max_turns)]
@@ -849,18 +870,34 @@ def main():
     started = time.time()
     try:
         result_event, stderr_tail = run_claude(cmd, message, workdir, env)
+        reply, is_error = read_result(result_event, stderr_tail)
+        if resume_id and is_error and context_overflow(reply, stderr_tail):
+            # The thread's session has filled its context window: nothing
+            # more fits, so every later turn would fail the same way. Start
+            # a fresh session for the thread (the record under chat/ and the
+            # notebook carry forward; the model's working memory of the
+            # thread does not) and answer this message in it. The new
+            # session_id goes out as usual, so the thread resumes it next.
+            log(f"[session] {resume_id} is full ({reply[:80]!r}); starting a fresh session for this thread")
+            session_id = str(uuid.uuid4())
+            resume_id = ""
+            before_path, before_lines = None, 0
+            cmd = base_cmd + ["--session-id", session_id]
+            if max_turns > 0:
+                cmd += ["--max-turns", str(max_turns)]
+            cmd += ["--model", model]
+            message = (
+                "(Note from the chat runner: the previous session of this thread filled its "
+                "context window and was closed; this is a fresh session. The thread's record is "
+                "under chat/ in the project and your notebook is in memory/. Say so in one line, "
+                "then answer.)\n\n" + message
+            )
+            result_event, stderr_tail = run_claude(cmd, message, workdir, env)
+            reply, is_error = read_result(result_event, stderr_tail)
     finally:
         shutil.rmtree(secret_dir, ignore_errors=True)
 
-    if result_event is None:
-        log("No result event from claude CLI.")
-        fail(stderr_tail or "claude exited without output.")
-
-    reply = result_event.get("result") or ""
     session_id = result_event.get("session_id") or session_id
-    is_error = bool(result_event.get("is_error")) or (
-        result_event.get("subtype") not in (None, "success")
-    )
     usage = result_event.get("usage") or {}
     log(
         f"[result] {result_event.get('subtype')} in {time.time() - started:.0f}s, "

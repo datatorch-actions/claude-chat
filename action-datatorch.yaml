@@ -14,7 +14,10 @@ description: >-
   input) is mirrored next to it and its index imported; after the turn
   the files the agent changed are written back to the project as the
   agent (MCP write_file), so every memory is a file version with its
-  name. Tools are limited to the project's DataTorch MCP server
+  name. Two turns of one agent may overlap (a chat reply during a work
+  turn) and share that folder: since v7 the later one keeps the other's
+  unsaved files, and each saves against the project's current copy, so
+  neither loses a memory or an index line. Tools are limited to the project's DataTorch MCP server
   (pipelines as tools), Read (working directory only), Write and Edit
   (the memory folder only), WebFetch and WebSearch; no shell. Every
   turn's transcript is uploaded to the project under chat/<thread_id>/.

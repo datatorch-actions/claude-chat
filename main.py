@@ -25,6 +25,7 @@ JSON string in sys.argv[-1]. Outputs are reported as `::key::<json>`
 stdout lines.
 """
 
+import atexit
 import glob
 import hashlib
 import json
@@ -39,6 +40,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # Windows has no advisory file locks; turns there run unguarded.
+    fcntl = None
 
 CONTEXT_FOLDER = "context/"
 CONTEXT_TEXT_EXTENSIONS = {"md", "markdown", "txt", "yaml", "yml", "json"}
@@ -56,6 +63,16 @@ MEMORY_FILES_MAX = 300
 MEMORY_INDEX_IMPORT_MAX_KB = 24
 MEMORY_FILE_MAX_BYTES = 128 * 1024
 MEMORY_TOOLS = "Read,Write,Edit,WebFetch,WebSearch"
+# Every turn of one agent runs in the same working directory, so two can be
+# in flight at once: a chat reply while a work turn runs. Each registers
+# itself under TURNS_DIR for as long as it runs, and takes MEMORY_LOCK for
+# the short moments it reads or writes the shared mirror (see sync_memory
+# and push_memory). An entry older than TURN_STALE_SECONDS, or whose
+# process is gone, is a turn that died without leaving.
+TURNS_DIR = ".turns"
+TURN_STALE_SECONDS = 3 * 3600
+MEMORY_LOCK = ".memory.lock"
+INDEX_LINK = re.compile(r"\]\(([^)\s]+)\)")
 # Pinned rather than the CLI default, which differs per runner machine.
 DEFAULT_MODEL = "claude-opus-5-5"
 
@@ -374,11 +391,111 @@ def memory_prefix(value: str, agent: str):
     return value + "/"
 
 
-def sync_memory(dt: DataTorch, login: str, slug: str, link: str, prefix: str, workdir: str) -> list:
-    """Mirror the notebook into <workdir>/memory before the turn."""
+@contextmanager
+def memory_lock(workdir: str):
+    """One turn at a time reads or writes the shared notebook mirror and the
+    turn registry. Held for seconds (a sync or a push), never for a session."""
+    if fcntl is None:
+        yield
+        return
+    with open(os.path.join(workdir, MEMORY_LOCK), "a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def register_turn(workdir: str) -> str:
+    """Mark this turn as in flight; returns the marker to remove afterwards.
+    Call it under memory_lock."""
+    folder = os.path.join(workdir, TURNS_DIR)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{os.getpid()}-{uuid.uuid4().hex}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"pid": os.getpid(), "started": time.time()}, f)
+    return path
+
+
+def unregister_turn(path):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def other_turns(workdir: str, own: str) -> int:
+    """How many other turns of this agent are in flight. Markers of turns
+    that died (no such process, or too old) are cleared. Call it under
+    memory_lock, so a marker is never read half-written."""
+    folder = os.path.join(workdir, TURNS_DIR)
+    if not os.path.isdir(folder):
+        return 0
+    count = 0
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if own and os.path.abspath(path) == os.path.abspath(own):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                entry = json.load(f)
+            fresh = time.time() - float(entry.get("started", 0)) < TURN_STALE_SECONDS
+            alive = fresh and pid_alive(int(entry.get("pid", 0)))
+        except (OSError, ValueError, TypeError):
+            alive = False
+        if alive:
+            count += 1
+        else:
+            unregister_turn(path)
+    return count
+
+
+def sync_memory(dt: DataTorch, login: str, slug: str, link: str, prefix: str, workdir: str, shared: bool = False) -> list:
+    """Bring the notebook into <workdir>/memory before the turn.
+
+    Alone, the folder becomes a mirror of the project's notebook, as it
+    always was. With another turn of this agent in flight (`shared`), the
+    folder is that turn's too and may hold memories it has written and not
+    saved yet: on 2026-11-12 a chat reply started while a work turn was
+    writing five memories, mirrored an empty notebook over them, and three
+    never reached the project. So a shared sync only adds what the folder
+    lacks: it deletes nothing and overwrites nothing. Returns the folder as
+    this turn found it, which is what push_memory compares against."""
     nodes = list_files(dt, login, slug, prefix)
     rows = folder_rows(nodes, link, prefix, (MEMORY_INDEX,), MEMORY_FILES_MAX)
-    return sync_folder(dt, rows, os.path.join(workdir, MEMORY_LOCAL_DIR))
+    target = os.path.join(workdir, MEMORY_LOCAL_DIR)
+    if not shared:
+        return sync_folder(dt, rows, target)
+    os.makedirs(target, exist_ok=True)
+    for row in rows:
+        path = os.path.join(target, *row["rel"].split("/"))
+        if os.path.exists(path):
+            continue
+        content = dt.download(row["id"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(content)
+    found = local_memory(workdir)
+    return [
+        {"rel": rel, "bytes": found[rel]["bytes"], "sha": found[rel]["sha"]}
+        for rel in sorted(found, key=lambda rel: (rel != MEMORY_INDEX, rel))
+    ]
 
 
 def local_memory(workdir: str) -> dict:
@@ -401,29 +518,89 @@ def local_memory(workdir: str) -> dict:
     return found
 
 
-def push_memory(dt: DataTorch, login: str, slug: str, key: str, prefix: str, before: list, workdir: str) -> dict:
+def merge_index(local: str, remote: str, existing: set) -> str:
+    """The index this turn holds, plus the lines the project's copy has for
+    memories this one does not mention. Two turns each add a line for the
+    memory they saved; whichever saves second must not drop the other's.
+    A line is carried over only when it links to a memory file that still
+    exists and that the local index has no line for. Nothing was missing:
+    the local text comes back untouched."""
+    lines = local.splitlines()
+    have = {line.strip() for line in lines if line.strip()}
+    linked = {target for line in lines for target in INDEX_LINK.findall(line)}
+    added = []
+    for line in remote.splitlines():
+        text = line.strip()
+        if not text or text in have:
+            continue
+        targets = INDEX_LINK.findall(line)
+        if not targets or any(target in linked for target in targets):
+            continue
+        if not all(target in existing for target in targets):
+            continue
+        added.append(line.rstrip())
+        have.add(text)
+    if not added:
+        return local
+    return "\n".join([*[line.rstrip() for line in lines], *added]).rstrip("\n") + "\n"
+
+
+def push_memory(dt: DataTorch, login: str, slug: str, link: str, key: str, prefix: str, before: list, workdir: str) -> dict:
     """Write the notebook's changes back to the project: new and changed
     files through MCP write_file as `key` (the agent, when the runner
     holds its key, so the file version carries its name); files the
     agent removed are deleted with this script's own key, since only the
     MCP door honours an agent key and it has no delete. Only paths under
-    the notebook prefix are ever touched. Returns counts and the lines
-    logged."""
+    the notebook prefix are ever touched.
+
+    The project is read again here, because another turn of this agent
+    may have saved in the meantime (see sync_memory). A file the project
+    already holds with the same content is left alone; one it holds with
+    other content is overwritten against the project's current version;
+    the index is merged first (merge_index). A file on disk that the
+    project lacks is written even when this turn did not change it, so a
+    memory left behind by a turn that died is not lost. Call it under
+    memory_lock. Returns counts and the lines logged."""
     was = {s["rel"]: s for s in before}
     now = local_memory(workdir)
     written, deleted, refused = [], [], []
+    try:
+        nodes = list_files(dt, login, slug, prefix)
+        rows = {r["rel"]: r for r in folder_rows(nodes, link, prefix, (MEMORY_INDEX,), MEMORY_FILES_MAX)}
+    except Exception as ex:
+        changed = [rel for rel in now if rel not in was or was[rel]["sha"] != now[rel]["sha"]]
+        if changed or any(rel not in now for rel in was):
+            refused.append(f"{prefix}: the notebook could not be listed ({ex}); nothing was saved this turn")
+        return {"written": written, "deleted": deleted, "refused": refused}
     for rel, state in sorted(now.items()):
         earlier = was.get(rel)
-        if earlier and earlier["sha"] == state["sha"]:
+        row = rows.get(rel)
+        if row and earlier and earlier["sha"] == state["sha"]:
             continue
         path = prefix + rel
-        if state["bytes"] > MEMORY_FILE_MAX_BYTES:
-            refused.append(f"{path} ({state['bytes'] // 1024} KB is over the {MEMORY_FILE_MAX_BYTES // 1024} KB memory file limit)")
+        data = state["content"]
+        remote = None
+        if row:
+            try:
+                remote = dt.download(row["id"])
+            except Exception as ex:
+                refused.append(f"{path}: {ex}")
+                continue
+        if rel == MEMORY_INDEX and remote is not None:
+            merged = merge_index(data.decode("utf-8", "replace"), remote.decode("utf-8", "replace"), set(now)).encode("utf-8")
+            if merged != data:
+                data = merged
+                with open(os.path.join(workdir, MEMORY_LOCAL_DIR, *rel.split("/")), "wb") as f:
+                    f.write(data)
+        if remote is not None and remote == data:
             continue
-        content = state["content"].decode("utf-8", "replace")
+        if len(data) > MEMORY_FILE_MAX_BYTES:
+            refused.append(f"{path} ({len(data) // 1024} KB is over the {MEMORY_FILE_MAX_BYTES // 1024} KB memory file limit)")
+            continue
+        content = data.decode("utf-8", "replace")
         args = (
-            {"file_id": earlier["id"], "content": content, "mode": "overwrite", "expected_md5": earlier["md5"]}
-            if earlier
+            {"file_id": row["id"], "content": content, "mode": "overwrite", "expected_md5": hashlib.md5(remote).hexdigest()}
+            if row
             else {"path": path, "content": content, "mode": "create"}
         )
         try:
@@ -434,7 +611,8 @@ def push_memory(dt: DataTorch, login: str, slug: str, key: str, prefix: str, bef
                 written.append(path)
         except Exception as ex:
             refused.append(f"{path}: {ex}")
-    gone = [was[rel] for rel in sorted(was) if rel not in now]
+    # Removed on disk since this turn began, and still in the project.
+    gone = [rows[rel] for rel in sorted(was) if rel not in now and rel in rows]
     if gone:
         try:
             dt.gql(
@@ -777,13 +955,23 @@ def main():
     # failed mirror means no notebook this turn (and no push, so a stale
     # mirror can never overwrite the project's copy).
     mem_prefix = memory_prefix(inputs.get("memory"), agent)
-    memory, memory_ok = [], False
+    memory, memory_ok, turn_marker = [], False, None
     if mem_prefix and project["link"]:
         try:
-            memory = sync_memory(dt, login, slug, project["link"], mem_prefix, workdir)
+            # Registered before the sync and until after the push, so a turn
+            # that starts meanwhile knows the folder is not its alone.
+            with memory_lock(workdir):
+                turn_marker = register_turn(workdir)
+                atexit.register(unregister_turn, turn_marker)
+                shared = other_turns(workdir, turn_marker) > 0
+                memory = sync_memory(dt, login, slug, project["link"], mem_prefix, workdir, shared)
             memory_ok = True
             index_kb = next((m["bytes"] for m in memory if m["rel"] == MEMORY_INDEX), 0) / 1024
-            log(f"[memory] {mem_prefix}: {len(memory)} file(s) mirrored" + (f", index {index_kb:.1f} KB" if index_kb else ", no index yet"))
+            log(
+                f"[memory] {mem_prefix}: {len(memory)} file(s) mirrored"
+                + (f", index {index_kb:.1f} KB" if index_kb else ", no index yet")
+                + ("; another turn of this agent is running, so its unsaved files were kept" if shared else "")
+            )
             if index_kb > MEMORY_INDEX_IMPORT_MAX_KB:
                 log(f"[memory] the index is over {MEMORY_INDEX_IMPORT_MAX_KB} KB; it should stay one line per memory")
         except Exception as ex:
@@ -931,7 +1119,9 @@ def main():
     # The notebook: what the agent wrote goes back to the project.
     memory_changes = ""
     if mem_prefix and memory_ok:
-        pushed = push_memory(dt, login, slug, mcp_key, mem_prefix, memory, workdir)
+        with memory_lock(workdir):
+            pushed = push_memory(dt, login, slug, project["link"], mcp_key, mem_prefix, memory, workdir)
+        unregister_turn(turn_marker)
         for path in pushed["written"]:
             log(f"[memory] wrote {path}")
         for path in pushed["deleted"]:

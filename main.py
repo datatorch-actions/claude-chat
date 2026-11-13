@@ -26,6 +26,7 @@ stdout lines.
 """
 
 import atexit
+import calendar
 import glob
 import hashlib
 import json
@@ -75,6 +76,20 @@ MEMORY_LOCK = ".memory.lock"
 INDEX_LINK = re.compile(r"\]\(([^)\s]+)\)")
 # Pinned rather than the CLI default, which differs per runner machine.
 DEFAULT_MODEL = "claude-opus-5-5"
+# Every step of a turn sends the whole session again. Claude Code keeps it
+# in the prompt cache for an hour after its last use, where a re-read costs
+# about a tenth of the price; past that the whole session is written to the
+# cache again at about twice the price. So a large session that has sat for
+# an hour is the dearest thing a turn can resume (2026-11-12: a 590,000
+# token thread cost 1.2M tokens' worth to answer "its good"). A minute
+# short of the hour, since a turn takes a while to reach its first request.
+CACHE_MINUTES = 59
+# The recap a replaced session of a chat thread starts with: the thread's
+# last messages, as the server writes it for a thread's first runner turn.
+RECAP_MESSAGES = 40
+RECAP_MESSAGE_CHARS = 6000
+RECAP_CHARS = 60000
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 
 def log(message: str):
@@ -812,6 +827,135 @@ def find_transcript(session_id: str):
     return max(matches, key=os.path.getmtime) if matches else None
 
 
+def session_state(path, now: float = None):
+    """How large a session is and how long it has sat: (tokens, minutes).
+    Tokens are what its last step sent to the model (fresh, cache-read and
+    cache-written input together), which is what resuming it sends again.
+    (0, 0) when the transcript holds no step to read."""
+    tokens, stamp = 0, None
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                if b'"usage"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("type") != "assistant" or event.get("isSidechain"):
+                    continue
+                usage = (event.get("message") or {}).get("usage") or {}
+                size = (
+                    int(usage.get("input_tokens") or 0)
+                    + int(usage.get("cache_read_input_tokens") or 0)
+                    + int(usage.get("cache_creation_input_tokens") or 0)
+                )
+                if size:
+                    tokens, stamp = size, event.get("timestamp")
+        if not tokens:
+            return 0, 0.0
+        last = None
+        if stamp:
+            try:
+                last = calendar.timegm(time.strptime(str(stamp)[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                last = None
+        if last is None:
+            last = os.path.getmtime(path)
+        now = time.time() if now is None else now
+        return tokens, max(0.0, (now - last) / 60)
+    except OSError:
+        return 0, 0.0
+
+
+def replace_reason(tokens: int, idle_minutes: float, max_tokens: int, max_cold_tokens: int) -> str:
+    """Why a session is not resumed, in words for the log and the agent;
+    empty when it is. Either limit at 0 is off."""
+    if max_tokens > 0 and tokens > max_tokens:
+        return f"it had grown to {tokens:,} tokens, over the limit of {max_tokens:,}"
+    if max_cold_tokens > 0 and idle_minutes >= CACHE_MINUTES and tokens > max_cold_tokens:
+        return (
+            f"it had sat for {idle_minutes / 60:.1f} hours at {tokens:,} tokens, "
+            f"over the limit of {max_cold_tokens:,} for a session gone cold"
+        )
+    return ""
+
+
+def recap_lines(messages: list, message: str) -> list:
+    """`Name: body` for a thread's last messages, oldest first, without
+    the message being answered and within the recap's size."""
+    rows = []
+    for m in messages:
+        body = (m.get("body") or "").strip()
+        if not body or m.get("error"):
+            continue
+        if m.get("source") == "system":
+            name = "Note"
+        elif m.get("authorAgent"):
+            name = m["authorAgent"].get("name") or "Agent"
+        else:
+            user = m.get("authorUser") or {}
+            name = user.get("name") or user.get("login") or "Person"
+        rows.append((name, body, bool(m.get("authorAgent"))))
+    # The message being answered is already in the thread: it is the turn's
+    # message, so it does not go into the recap as well.
+    if rows and not rows[-1][2] and rows[-1][1] == message.strip():
+        rows.pop()
+    lines, used = [], 0
+    for name, body, _ in reversed(rows[-RECAP_MESSAGES:]):
+        if len(body) > RECAP_MESSAGE_CHARS:
+            body = body[:RECAP_MESSAGE_CHARS].rstrip() + " [cut]"
+        line = f"{name}: {body}"
+        if lines and used + len(line) > RECAP_CHARS:
+            break
+        lines.append(line)
+        used += len(line)
+    return list(reversed(lines))
+
+
+def thread_recap(dt: "DataTorch", thread_id: str, message: str) -> list:
+    """The last messages of a chat thread, for a session that replaces the
+    thread's earlier one. Empty when thread_id is not a chat thread the
+    runner's user can read (a work turn's thread is a name, not a thread)."""
+    if not UUID_RE.fullmatch(thread_id or ""):
+        return []
+    try:
+        data = dt.gql(
+            "query($id: ID!, $limit: Int){ chatMessages(threadId: $id, limit: $limit)"
+            "{ body source error authorUser { login name } authorAgent { name } } }",
+            {"id": thread_id, "limit": RECAP_MESSAGES + 1},
+        )
+    except Exception as ex:
+        log(f"[session] no recap of thread {thread_id}: {ex}")
+        return []
+    return recap_lines(data.get("chatMessages") or [], message)
+
+
+def fresh_message(reason: str, recap: list, message: str) -> str:
+    """The turn's message for a session that replaces an earlier one."""
+    note = (
+        f"(Note from the chat runner: the earlier session here was closed because {reason}. "
+        "This is a fresh session with no memory of that one. Your notebook is in memory/, "
+        "your files are where you left them, and the record of the earlier session is under "
+        "chat/ in the project. Do not mention this note; carry on.)"
+    )
+    if not recap:
+        return f"{note}\n\n{message}"
+    return "\n".join([note, "", "Earlier in this thread:", *recap, "", "The new message:", message])
+
+
+def usage_line(usage: dict) -> str:
+    """Input tokens of a turn, split by what they cost: read from the
+    cache (cheap), written to it (dear), and neither."""
+    read = int(usage.get("cache_read_input_tokens") or 0)
+    written = int(usage.get("cache_creation_input_tokens") or 0)
+    plain = int(usage.get("input_tokens") or 0)
+    return (
+        f"{plain + read + written} in / {int(usage.get('output_tokens') or 0)} out tokens "
+        f"(input: {read} read from cache, {written} written to cache, {plain} uncached)"
+    )
+
+
 def count_lines(path) -> int:
     if not path or not os.path.exists(path):
         return 0
@@ -930,8 +1074,27 @@ def main():
     model = (inputs.get("model") or "").strip() or DEFAULT_MODEL
     max_turns = int(inputs.get("max_turns") or 0)
 
+    # A session too large to be worth resuming is replaced before the turn:
+    # see CACHE_MINUTES. Its thread keeps its name and its record.
+    max_tokens = int(inputs.get("max_session_tokens") or 0)
+    max_cold_tokens = int(inputs.get("max_cold_session_tokens") or 0)
+    raw_thread = (inputs.get("thread_id") or "").strip()
+    replaced = ""
+    if resume_id and (max_tokens > 0 or max_cold_tokens > 0):
+        resume_path = find_transcript(resume_id)
+        if resume_path:
+            tokens, idle = session_state(resume_path)
+            replaced = replace_reason(tokens, idle, max_tokens, max_cold_tokens)
+            if replaced:
+                log(f"[session] {resume_id} is not resumed: {replaced}; starting a fresh session")
+                # A thread named after its first session keeps that name.
+                raw_thread = raw_thread or resume_id
+                resume_id = ""
+            else:
+                log(f"[session] resuming {resume_id}: {tokens:,} tokens, idle {idle:.0f} min")
+
     session_id = resume_id or str(uuid.uuid4())
-    thread_id = safe_segment((inputs.get("thread_id") or "").strip() or session_id)
+    thread_id = safe_segment(raw_thread or session_id)
 
     # One working directory per project and agent: Claude Code keys its
     # session store and auto-memory on the cwd, so every thread of the
@@ -1054,6 +1217,12 @@ def main():
             "a new thread (empty session_id)."
         )
 
+    if replaced:
+        recap = thread_recap(dt, (inputs.get("thread_id") or "").strip(), message)
+        if recap:
+            log(f"[session] the fresh session starts with the thread's last {len(recap)} message(s)")
+        message = fresh_message(replaced, recap, message)
+
     env = child_environment(os.environ)
     started = time.time()
     try:
@@ -1089,9 +1258,7 @@ def main():
     usage = result_event.get("usage") or {}
     log(
         f"[result] {result_event.get('subtype')} in {time.time() - started:.0f}s, "
-        f"{result_event.get('num_turns')} turn(s), "
-        f"{usage.get('input_tokens', 0) + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)} in / "
-        f"{usage.get('output_tokens', 0)} out tokens"
+        f"{result_event.get('num_turns')} turn(s), {usage_line(usage)}"
     )
 
     # The record: this turn's slice of the session transcript.

@@ -6,7 +6,12 @@ description: >-
   and returns its session_id, later turns pass that id back to resume
   it with full memory (when a resumed session has filled its context
   window, the turn starts a fresh session for the thread and says so;
-  since v6). Before each turn the project's context/ folder
+  since v6). Resuming sends the whole session again on every step, so
+  since v8 a pipeline can set limits (max_session_tokens,
+  max_cold_session_tokens) past which the turn starts a fresh session
+  instead, with the last messages of the chat thread as its recap; the
+  [result] log line splits input tokens into read from cache, written
+  to cache and uncached. Before each turn the project's context/ folder
   is synced into a per-project working directory with a generated
   CLAUDE.md, so the agent reads the same standing context as the
   project's model steps. The agent's memory notebook (a folder of the
@@ -71,6 +76,25 @@ inputs:
     type: integer
     description: Maximum agent turns within this message; 0 means no explicit cap.
     default: 30
+  max_session_tokens:
+    type: integer
+    description: >-
+      Size limit for resuming. When the session's last step sent more
+      input tokens than this, the turn starts a fresh session instead
+      (session_id out is the new one). The fresh session is told so, and
+      when thread_id is a chat thread it starts with the thread's last 40
+      messages. 0 (the default) never replaces a session for its size.
+    default: 0
+  max_cold_session_tokens:
+    type: integer
+    description: >-
+      The same limit for a session whose last step was an hour or more
+      ago. By then it has left the prompt cache, so resuming writes all
+      of it again at about twice the input price, where a warm session
+      is re-read at about a tenth; a lower limit here than
+      max_session_tokens stops the dear case and leaves a busy session
+      alone. 0 (the default) is off.
+    default: 0
 outputs:
   reply:
     type: string
